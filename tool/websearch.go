@@ -33,6 +33,8 @@ type searchProvider interface {
 
 // WebSearchConfig selects and configures the active search backend.
 type WebSearchConfig struct {
+	// UserAgent overrides the HTTP identifier for every search backend.
+	UserAgent string
 	// Backend chooses the provider: "ddgs" (DuckDuckGo scrape, no key),
 	// "brave-free" (Brave Search API, needs BraveAPIKey), "tavily" (Tavily
 	// Search API, needs TavilyAPIKey), or "deepseek" (DeepSeek's server-side
@@ -106,7 +108,10 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 	if backend == "" {
 		backend = "ddgs"
 	}
-	client := newFetchClient(WebFetchConfig{Proxy: cfg.Proxy, CACert: cfg.CACert, InsecureTLS: cfg.InsecureTLS})
+	if backend == "ddgs" && cfg.UserAgent == "" {
+		cfg.UserAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+	}
+	client := newFetchClient(WebFetchConfig{Proxy: cfg.Proxy, CACert: cfg.CACert, InsecureTLS: cfg.InsecureTLS, UserAgent: cfg.UserAgent})
 	switch backend {
 	case "ddgs":
 		return &ddgsProvider{client: client, endpoint: ddgsEndpoint}, nil
@@ -220,8 +225,6 @@ func (p *ddgsProvider) Search(ctx context.Context, query string, limit int) ([]S
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// A browser-like UA — the endpoint blocks obviously-automated clients.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
 	req.Header.Set("Referer", "https://html.duckduckgo.com/")
 	resp, err := p.client.Do(req)
 	if err != nil {

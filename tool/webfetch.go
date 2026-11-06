@@ -20,6 +20,8 @@ import (
 
 // WebFetchConfig tunes the network behavior of a WebFetch tool.
 type WebFetchConfig struct {
+	// UserAgent overrides the default identifier for requests and redirects.
+	UserAgent string
 	// Proxy, when set, routes requests through this http(s) proxy URL. Empty = direct.
 	Proxy string
 	// CACert, when set, is a path to a PEM CA certificate added to the system
@@ -42,6 +44,9 @@ type WebFetchConfig struct {
 // TLS verification (see WebFetchConfig). It is network-facing, so it is not part
 // of DefaultTools and requires permission to run.
 func NewWebFetch(cfg WebFetchConfig) CoreTool {
+	if cfg.UserAgent == "" {
+		cfg.UserAgent = "norma/0.4"
+	}
 	return Build(Spec{
 		Name:        "WebFetch",
 		Description: "Fetches an HTTP(S) HTML page, documentation page, or API response and returns it as Markdown. Do not use this tool for static assets, including JavaScript, CSS, source maps, images, fonts, audio, or video—even if their URLs are found in a fetched page or explicitly requested. Fetch the owning page instead. Set `extract=true` to list comments, scripts, stylesheets, endpoints, forms, links, and meta tags. Listed asset URLs are for inspection only and must not be fetched. Large responses may be truncated. This makes an external network request.",
@@ -70,7 +75,7 @@ const maxFetchBytes = 2 << 20 // 2 MiB
 // newFetchClient returns an HTTP client honoring the proxy / TLS config.
 func newFetchClient(cfg WebFetchConfig) *http.Client {
 	if cfg.Proxy == "" && !cfg.InsecureTLS && cfg.CACert == "" {
-		return &http.Client{}
+		return withUserAgent(&http.Client{}, cfg.UserAgent)
 	}
 	tr := &http.Transport{}
 	if cfg.Proxy != "" {
@@ -94,7 +99,30 @@ func newFetchClient(cfg WebFetchConfig) *http.Client {
 			}
 		}
 	}
-	return &http.Client{Transport: tr}
+	return withUserAgent(&http.Client{Transport: tr}, cfg.UserAgent)
+}
+
+type userAgentTransport struct {
+	base  http.RoundTripper
+	value string
+}
+
+func (t userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("User-Agent", t.value)
+	return t.base.RoundTrip(req)
+}
+
+func withUserAgent(client *http.Client, value string) *http.Client {
+	if value == "" {
+		return client
+	}
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	client.Transport = userAgentTransport{base: base, value: value}
+	return client
 }
 
 // proxyLikelyErr reports whether a fetch error is the kind a recording/MITM proxy
@@ -163,7 +191,7 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 	// otherwise-reachable URL. nil when no proxy is configured (nothing to bypass).
 	var direct *http.Client
 	if cfg.Proxy != "" {
-		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS})
+		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS, UserAgent: cfg.UserAgent})
 	}
 	return func(ctx context.Context, input json.RawMessage, _ *ToolContext) (Result, error) {
 		var in struct {
@@ -185,14 +213,12 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 		if err != nil {
 			return Errorf("Error: " + err.Error()), nil
 		}
-		req.Header.Set("user-agent", "norma/0.4")
 		resp, err := client.Do(req)
 		// One direct retry when the proxied attempt failed for a proxy-caused reason.
 		// A non-proxy error (bad host, caller timeout/cancel) is returned as-is — a
 		// direct retry wouldn't fix it. The direct response is NOT captured by the proxy.
 		if err != nil && direct != nil && proxyLikelyErr(err) {
 			if r2, e2 := http.NewRequestWithContext(cctx, http.MethodGet, in.URL, nil); e2 == nil {
-				r2.Header.Set("user-agent", "norma/0.4")
 				if resp2, err2 := direct.Do(r2); err2 == nil {
 					resp, err = resp2, nil
 				} else {

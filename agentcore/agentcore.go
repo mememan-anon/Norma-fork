@@ -92,7 +92,8 @@ type Options struct {
 	Skills *skill.Registry
 
 	// EnableWebFetch adds the network-facing WebFetch tool (permission-gated).
-	EnableWebFetch bool
+	EnableWebFetch    bool
+	WebFetchUserAgent string
 	// WebFetchProxy, when set, routes WebFetch requests through this http(s) proxy
 	// URL (e.g. a recording/intercepting proxy). Empty = direct connection.
 	WebFetchProxy string
@@ -104,7 +105,8 @@ type Options struct {
 	// fallback when no CA cert is available; prefer WebFetchCACert.
 	WebFetchInsecureTLS bool
 	// EnableWebSearch adds the network-facing web_search tool (permission-gated).
-	EnableWebSearch bool
+	EnableWebSearch    bool
+	WebSearchUserAgent string
 	// WebSearchBackend selects the search backend: "ddgs" (DuckDuckGo, no key),
 	// "brave-free" (Brave Search API), "tavily" (Tavily Search API), or
 	// "deepseek" (DeepSeek's server-side search). Empty defaults to "ddgs".
@@ -286,13 +288,13 @@ func NewSession(opts Options) *Session {
 		tools = append(tools, opts.Skills.Tool())
 	}
 	if opts.EnableWebFetch {
-		tools = append(tools, tool.NewWebFetch(tool.WebFetchConfig{Proxy: opts.WebFetchProxy, CACert: opts.WebFetchCACert, InsecureTLS: opts.WebFetchInsecureTLS}))
+		tools = append(tools, tool.NewWebFetch(tool.WebFetchConfig{Proxy: opts.WebFetchProxy, CACert: opts.WebFetchCACert, InsecureTLS: opts.WebFetchInsecureTLS, UserAgent: opts.WebFetchUserAgent}))
 	}
 	if opts.EnableWebSearch {
 		// A misconfigured backend (unknown name, or brave-free without a key)
 		// drops the tool rather than failing the whole session — the rest of the
 		// agent stays usable and the missing tool surfaces the misconfig.
-		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, DeepSeekBaseURL: opts.DeepSeekSearchBaseURL, DeepSeekAPIKey: opts.DeepSeekSearchAPIKey, DeepSeekModel: opts.DeepSeekSearchModel, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS}); err == nil {
+		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, DeepSeekBaseURL: opts.DeepSeekSearchBaseURL, DeepSeekAPIKey: opts.DeepSeekSearchAPIKey, DeepSeekModel: opts.DeepSeekSearchModel, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS, UserAgent: opts.WebSearchUserAgent}); err == nil {
 			tools = append(tools, ws)
 		}
 	}
