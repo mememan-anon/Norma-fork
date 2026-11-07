@@ -23,6 +23,9 @@ import (
 // composes with the host's own transcript/compaction (no previous_response_id).
 type openaiResponsesProvider struct{ cfg Config }
 
+const seResponsesToolDone StreamEventType = "responses_tool_done"
+const seResponsesArgsDone StreamEventType = "responses_args_done"
+
 // ---- request ----
 
 type orReq struct {
@@ -147,6 +150,49 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 		}
 		defer resp.Body.Close()
 		scan := newSSEScanner(resp.Body)
+		// The harness dispatches at the next tool start, so emit each call only
+		// after its arguments are complete and keep parallel calls in output order.
+		type pendingTool struct {
+			id, name string
+			args     strings.Builder
+			final    string
+			done     bool
+		}
+		pending := map[int]*pendingTool{}
+		var order []int
+		next := 0
+		getTool := func(index int) *pendingTool {
+			if t := pending[index]; t != nil {
+				return t
+			}
+			t := &pendingTool{}
+			pending[index] = t
+			order = append(order, index)
+			return t
+		}
+		emitReady := func(flush bool) bool {
+			for next < len(order) {
+				t := pending[order[next]]
+				if !t.done && !flush {
+					break
+				}
+				if t.name == "" && !flush {
+					break
+				}
+				if t.name != "" {
+					args := t.final
+					if args == "" {
+						args = t.args.String()
+					}
+					if !yield(StreamEvent{Type: SEToolUseStart, ToolID: t.id, ToolName: t.name}, nil) ||
+						!yield(StreamEvent{Type: SEToolInputJSON, Text: args}, nil) {
+						return false
+					}
+				}
+				next++
+			}
+			return true
+		}
 		for {
 			event, data, serr := scan.next()
 			if serr == io.EOF {
@@ -167,6 +213,41 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 			if !ok {
 				continue
 			}
+			switch ev.Type {
+			case SEToolUseStart:
+				t := getTool(ev.ToolIndex)
+				t.id, t.name = ev.ToolID, ev.ToolName
+				continue
+			case SEToolInputJSON:
+				t := getTool(ev.ToolIndex)
+				if !t.done {
+					t.args.WriteString(ev.Text)
+				}
+				continue
+			case seResponsesToolDone:
+				t := getTool(ev.ToolIndex)
+				if ev.ToolID != "" {
+					t.id = ev.ToolID
+				}
+				if ev.ToolName != "" {
+					t.name = ev.ToolName
+				}
+				if ev.Text != "" {
+					t.final = ev.Text
+				}
+				t.done = true
+				if !emitReady(false) {
+					return
+				}
+				continue
+			case seResponsesArgsDone:
+				getTool(ev.ToolIndex).final = ev.Text
+				continue
+			case SEMessageDelta:
+				if !emitReady(true) {
+					return
+				}
+			}
 			if !yield(ev, nil) {
 				return
 			}
@@ -175,13 +256,14 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 }
 
 // parseResponsesFrame maps one named Responses SSE event to a neutral
-// StreamEvent. Unrecognized events (response.created, *.in_progress, item.done,
+// StreamEvent. Unrecognized events (response.created, *.in_progress,
 // content_part.*, etc.) return ok=false and are skipped.
 func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 	// The event name is authoritative; some gateways omit the SSE `event:` line
 	// and put the discriminator only in the JSON `type` field, so fall back to it.
 	var f struct {
-		Type string `json:"type"`
+		Type        string `json:"type"`
+		OutputIndex int    `json:"output_index"`
 		// output_item.added: item carries the function_call id/name.
 		Item struct {
 			Type      string `json:"type"`
@@ -189,8 +271,9 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 			Name      string `json:"name"`
 			Arguments string `json:"arguments"`
 		} `json:"item"`
-		Delta    string `json:"delta"` // *_text.delta / function_call_arguments.delta
-		Response struct {
+		Delta     string `json:"delta"`     // *_text.delta / function_call_arguments.delta
+		Arguments string `json:"arguments"` // function_call_arguments.done
+		Response  struct {
 			Status            string `json:"status"`
 			IncompleteDetails *struct {
 				Reason string `json:"reason"`
@@ -211,7 +294,11 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 	switch kind {
 	case "response.output_item.added":
 		if f.Item.Type == "function_call" {
-			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name}, true, nil
+			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name, ToolIndex: f.OutputIndex}, true, nil
+		}
+	case "response.output_item.done":
+		if f.Item.Type == "function_call" {
+			return StreamEvent{Type: seResponsesToolDone, ToolID: f.Item.CallID, ToolName: f.Item.Name, ToolIndex: f.OutputIndex, Text: f.Item.Arguments}, true, nil
 		}
 	case "response.output_text.delta":
 		if f.Delta != "" {
@@ -223,8 +310,10 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 		}
 	case "response.function_call_arguments.delta":
 		if f.Delta != "" {
-			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta}, true, nil
+			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta, ToolIndex: f.OutputIndex}, true, nil
 		}
+	case "response.function_call_arguments.done":
+		return StreamEvent{Type: seResponsesArgsDone, Text: f.Arguments, ToolIndex: f.OutputIndex}, true, nil
 	case "response.completed", "response.incomplete":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: "end_turn"}
 		if f.Response.IncompleteDetails != nil && f.Response.IncompleteDetails.Reason == "max_output_tokens" {

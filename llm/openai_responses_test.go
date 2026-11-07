@@ -61,6 +61,51 @@ func TestResponsesStreaming(t *testing.T) {
 	}
 }
 
+// Final arguments belong to their output_index even when parallel calls finish
+// out of order. Each call must reach the harness as adjacent start/arguments
+// events, since that is when it dispatches a tool.
+func TestResponsesStreamingParallelFinalArguments(t *testing.T) {
+	body := sse2(
+		event("response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c0","name":"Bash"}}`),
+		event("response.output_item.added", `{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"c1","name":"Read"}}`),
+		event("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"file_path\":"}`),
+		event("response.output_item.done", `{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"c1","name":"Read","arguments":"{\"file_path\":\"a.txt\"}"}}`),
+		event("response.output_item.done", `{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c0","name":"Bash","arguments":"{\"command\":\"pwd\"}"}}`),
+		event("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":\"pwd\"}"}`),
+		event("response.completed", `{"type":"response.completed","response":{"status":"completed"}}`),
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+	defer srv.Close()
+	p, _ := NewProvider(Config{Format: FormatOpenAIResponses, BaseURL: srv.URL, APIKey: "k", Model: "m"})
+	acc := NewAccumulator()
+	var got []StreamEvent
+	for ev, err := range p.Stream(context.Background(), CompletionRequest{Messages: []Message{UserText("go")}}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev)
+		acc.Add(ev)
+	}
+	if len(got) != 5 || got[0].Type != SEToolUseStart || got[1].Type != SEToolInputJSON ||
+		got[2].Type != SEToolUseStart || got[3].Type != SEToolInputJSON || got[4].Type != SEMessageDelta {
+		t.Fatalf("events=%+v", got)
+	}
+	uses := acc.Message().ToolUses()
+	if len(uses) != 2 || uses[0].ID != "c0" || string(uses[0].Input) != `{"command":"pwd"}` ||
+		uses[1].ID != "c1" || string(uses[1].Input) != `{"file_path":"a.txt"}` {
+		t.Fatalf("tool uses=%+v", uses)
+	}
+	// The next model request must replay both calls with their original IDs and inputs.
+	input := toResponsesInput([]Message{acc.Message(), {Role: RoleUser, Content: []ContentBlock{
+		ToolResultText("c0", "ok", false), ToolResultText("c1", "ok", false),
+	}}})
+	if len(input) != 4 || input[0].CallID != "c0" || input[0].Arguments != `{"command":"pwd"}` ||
+		input[1].CallID != "c1" || input[1].Arguments != `{"file_path":"a.txt"}` ||
+		input[2].CallID != "c0" || input[3].CallID != "c1" {
+		t.Fatalf("replayed input=%+v", input)
+	}
+}
+
 // TestResponsesComplete verifies the non-streaming path parses output[] items
 // (message / reasoning / function_call) and sends a stateless stream:false body.
 func TestResponsesComplete(t *testing.T) {
